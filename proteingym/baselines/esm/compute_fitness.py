@@ -138,7 +138,7 @@ def create_parser():
     parser.add_argument(
         "--scoring-strategy",
         type=str,
-        default="wt-marginals",
+        default="masked-marginals",  # ESM1v, ESM2, MSATransformer all use masked-marginals: ESM1b with the Brandes paper use wt-marginals
         choices=["wt-marginals", "pseudo-ppl", "masked-marginals"],
         help=""
     )
@@ -212,6 +212,7 @@ def create_parser():
         action='store_true',
         help='Whether to overwrite prior scores in the dataframe'
     )
+    parser.add_argument("--device", type=str, default="cuda", help="Device (cpu, cuda or mps for Mac M1)")
     
     parser.add_argument("--nogpu", action="store_true", help="Do not use GPU even if available")
     return parser
@@ -229,7 +230,7 @@ def label_row(row, sequence, token_probs, alphabet, offset_idx):
     return score
 
 
-def compute_pppl(row, sequence, model, alphabet, offset_idx):
+def compute_pppl(row, sequence, model, alphabet, offset_idx, device):
     wt, idx, mt = row[0], int(row[1:-1]) - offset_idx, row[-1]
     assert sequence[idx] == wt, "The listed wildtype does not match the provided sequence"
 
@@ -245,7 +246,7 @@ def compute_pppl(row, sequence, model, alphabet, offset_idx):
 
     batch_labels, batch_strs, batch_tokens = batch_converter(data)
 
-    wt_encoded, mt_encoded = alphabet.get_idx(wt), alphabet.get_idx(mt)
+    wt_encoded, mt_encoded = alphabet.get_idx(wt), alphabet.get_idx(mt) # Note: This isn't used
 
     # compute probabilities at each position
     log_probs = []
@@ -253,14 +254,82 @@ def compute_pppl(row, sequence, model, alphabet, offset_idx):
         batch_tokens_masked = batch_tokens.clone()
         batch_tokens_masked[0, i] = alphabet.mask_idx
         with torch.no_grad():
-            token_probs = torch.log_softmax(model(batch_tokens_masked.cuda())["logits"], dim=-1)
+            token_probs = torch.log_softmax(model(batch_tokens_masked.to(device))["logits"], dim=-1)
         log_probs.append(token_probs[0, i, alphabet.get_idx(sequence[i])].item())  # vocab size
+    return sum(log_probs)
+
+def compute_pppl_mutated_sequence(row, model, alphabet, device):
+    sequence = row
+    
+    if len(sequence) > 1022:
+        print("Custom pppl: Not supporting sliding window. Returning 0")
+        return 0
+    # print("Debug length = ", len(sequence))
+
+    # encode the sequence
+    data = [
+        ("protein1", sequence),
+    ]
+
+    batch_converter = alphabet.get_batch_converter()
+    batch_labels, batch_strs, batch_tokens = batch_converter(data)
+    
+    # compute probabilities at each position
+    sequence = row
+    log_probs = []
+    
+    # Starts at 1 and ends at len(sequence) - 1 because of the <BOS> and <EOS> tokens
+    for i in tqdm(range(1, len(sequence) - 1), leave=False, mininterval=5, position=1): #, desc="Computing PPPL, positions" 
+        batch_tokens_masked = batch_tokens.clone()
+        batch_tokens_masked[0, i] = alphabet.mask_idx
+        with torch.no_grad():
+            token_probs = torch.log_softmax(model(batch_tokens_masked.to(device))["logits"], dim=-1)
+        log_probs.append(token_probs[0, i, alphabet.get_idx(sequence[i])].item())  # vocab size
+    return sum(log_probs)
+    
+def compute_pppl_mutated_sequence_batched(row, model, alphabet, device, position_batch_size=2):
+    sequence = row
+    
+    if len(sequence) > 1022:
+        print("Custom pppl: Not supporting sliding window. Returning 0")
+        return 0
+    print("Debug length = ", len(sequence))
+    
+    # encode the sequence again but manually replace with mask tokens
+    data = []
+    # Here we mask out the full length of the sequence - it's just that when we read the tokens back, we'll manually skip the first and last position (which should work out correctly)
+    for i in range(len(sequence)):
+        data.append((str(i), sequence[:i] + "<mask>" + sequence[i+1:]))  
+
+    batch_converter = alphabet.get_batch_converter()
+    
+    # compute probabilities at each position
+    sequence = row
+    log_probs = []
+    
+    # Note: This doesn't speed anything up on my Mac.. Still 2 tokens per second. But worth a try.
+    for i in tqdm(range(0, len(sequence), position_batch_size)):
+        data_subset = data[i:i+position_batch_size]
+        batch_labels, batch_strs, batch_tokens = batch_converter(data_subset)
+        print(f"Batch sizes custom token masking: {batch_tokens.size()}")
+        batch_lens = (batch_tokens != alphabet.padding_idx).sum(1)
+        print(f"Batch lengths custom token masking: {batch_lens}")
+        with torch.no_grad():
+            token_probs = torch.log_softmax(model(batch_tokens.to(device))["logits"], dim=-1)
+        for j in range(batch_tokens.shape[0]):
+            log_probs.append(token_probs[0, i+j, alphabet.get_idx(sequence[i+j])].item())
     return sum(log_probs)
 
 
 def main(args):
     if not os.path.exists(args.dms_output): os.mkdir(args.dms_output)
     print("Arguments:", args)
+    
+    device = args.device
+
+    if "cuda" in device and not torch.cuda.is_available():
+        print("Error: CUDA not available, but it is selected. To use CPU, use --device cpu")
+        exit(1)
 
     # Load the deep mutational scan
     if args.dms_index is not None:
@@ -276,7 +345,11 @@ def main(args):
         row = row.iloc[0]
         row = row.replace(np.nan, "")  # Makes it more manageable to use in strings
 
-        args.sequence = row["target_seq"].upper()
+        if args.scoring_strategy == "pseudo-ppl":
+            print("Note: pseudo-ppl not normalizing by WT")
+            args.sequence = ""
+        else:
+            args.sequence = row["target_seq"].upper()
         args.dms_input = str(args.dms_input)+os.sep+row["DMS_filename"]
 
         mutant_col = row["DMS_mutant_column"] if "DMS_mutant_column" in mapping_protein_seq_DMS.columns else "mutant"
@@ -319,11 +392,7 @@ def main(args):
         model, alphabet = pretrained.load_model_and_alphabet(model_location)
         model_location = model_location.split("/")[-1].split(".")[0]
         model.eval()
-        if torch.cuda.is_available() and not args.nogpu:
-            model = model.cuda()
-            print("Transferred model to GPU")
-        else:
-            print(f"Not using GPU. torch.cuda.is_available(): {torch.cuda.is_available()}, args.nogpu: {args.nogpu}")
+        model = model.to(device)
 
         batch_converter = alphabet.get_batch_converter()
 
@@ -360,7 +429,7 @@ def main(args):
                         start=0
                     with torch.no_grad():
                         token_probs = torch.log_softmax(
-                            model(batch_tokens_masked.cuda())["logits"], dim=-1
+                            model(batch_tokens_masked.to(device))["logits"], dim=-1
                         )
                     all_token_probs.append(token_probs[:, 0, i-start].detach().cpu())  # vocab size
                 token_probs = torch.cat(all_token_probs, dim=0).unsqueeze(0) 
@@ -389,9 +458,9 @@ def main(args):
                 with torch.no_grad():
                     if batch_tokens.size(1) > 1024 and args.scoring_window=="overlapping": 
                         batch_size, seq_len = batch_tokens.shape #seq_len includes BOS and EOS
-                        token_probs = torch.zeros((batch_size,seq_len,len(alphabet))).cuda() # Note: batch_size = 1 (need to keep batch dimension to score with model though)
-                        token_weights = torch.zeros((batch_size,seq_len)).cuda()
-                        weights = torch.ones(1024).cuda() # 1 for 256≤i<1022-256
+                        token_probs = torch.zeros((batch_size,seq_len,len(alphabet))).to(device) # Note: batch_size = 1 (need to keep batch dimension to score with model though)
+                        token_weights = torch.zeros((batch_size,seq_len)).to(device)
+                        weights = torch.ones(1024).to(device) # 1 for 256≤i<1022-256
                         for i in range(1,257):
                             weights[i] = 1 / (1 + math.exp(-(i-128)/16))
                         for i in range(1022-256,1023):
@@ -402,11 +471,11 @@ def main(args):
                         end_right_window = batch_tokens.size(1) - 1
                         while True: 
                             # Left window update
-                            left_window_probs = torch.log_softmax(model(batch_tokens[:,start_left_window:end_left_window+1].cuda())["logits"], dim=-1)
+                            left_window_probs = torch.log_softmax(model(batch_tokens[:,start_left_window:end_left_window+1].to(device))["logits"], dim=-1)
                             token_probs[:,start_left_window:end_left_window+1] += left_window_probs * weights.view(-1,1)
                             token_weights[:,start_left_window:end_left_window+1] += weights
                             # Right window update
-                            right_window_probs = torch.log_softmax(model(batch_tokens[:,start_right_window:end_right_window+1].cuda())["logits"], dim=-1)
+                            right_window_probs = torch.log_softmax(model(batch_tokens[:,start_right_window:end_right_window+1].to(device))["logits"], dim=-1)
                             token_probs[:,start_right_window:end_right_window+1] += right_window_probs * weights.view(-1,1)
                             token_weights[:,start_right_window:end_right_window+1] += weights
                             if end_left_window > start_right_window:
@@ -421,13 +490,13 @@ def main(args):
                         if final_overlap < 511:
                             start_central_window = int(seq_len / 2) - 512
                             end_central_window = start_central_window + 1023
-                            central_window_probs = torch.log_softmax(model(batch_tokens[:,start_central_window:end_central_window+1].cuda())["logits"], dim=-1)
+                            central_window_probs = torch.log_softmax(model(batch_tokens[:,start_central_window:end_central_window+1].to(device))["logits"], dim=-1)
                             token_probs[:,start_central_window:end_central_window+1] += central_window_probs * weights.view(-1,1)
                             token_weights[:,start_central_window:end_central_window+1] += weights
                         #Weight normalization
                         token_probs = token_probs / token_weights.view(-1,1) #Add 1 to broadcast
                     else:                    
-                        token_probs = torch.log_softmax(model(batch_tokens.cuda())["logits"], dim=-1)
+                        token_probs = torch.log_softmax(model(batch_tokens.to(device))["logits"], dim=-1)
                 df[model_location] = df.apply(
                     lambda row: label_row(
                         row[args.mutation_col],
@@ -455,7 +524,7 @@ def main(args):
                         start=0
                     with torch.no_grad():
                         token_probs = torch.log_softmax(
-                            model(batch_tokens_masked.cuda())["logits"], dim=-1
+                            model(batch_tokens_masked.to(device))["logits"], dim=-1
                         )
                     all_token_probs.append(token_probs[:, i-start])  # vocab size
                 token_probs = torch.cat(all_token_probs, dim=0).unsqueeze(0)
@@ -472,8 +541,8 @@ def main(args):
             elif args.scoring_strategy == "pseudo-ppl":
                 tqdm.pandas()
                 df[model_location] = df.progress_apply(
-                    lambda row: compute_pppl(
-                        row[args.mutation_col], args.sequence, model, alphabet, args.offset_idx
+                    lambda row: compute_pppl_mutated_sequence(  # compute_pppl(
+                        row["mutated_sequence"], model, alphabet, device,
                     ),
                     axis=1,
                 )

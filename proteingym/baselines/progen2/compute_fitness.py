@@ -122,9 +122,16 @@ def main():
     parser.add_argument('--indel_mode', action='store_true', help='Whether to score sequences with insertions and deletions')
     parser.add_argument('--fp16', action='store_true', help='Whether to score sequences with half precision')
     parser.add_argument('--test', action='store_true', help='Test mode of fitness computation')
+    parser.add_argument("--device", default="cuda", type=str, help="Device (cuda or cpu or mps)")
+    parser.add_argument("--raw_score", action="store_true", help="Whether to return raw scores, without any DMS_score or anything.")
     args = parser.parse_args()
+    device = args.device
+    
+    if "cuda" in device and not torch.cuda.is_available():
+        print("Error: CUDA not available, but it is selected. To use CPU, use --device cpu")
+        exit(1)
 
-    model = create_model(ckpt=args.Progen2_model_name_or_path, fp16=args.fp16).cuda()
+    model = create_model(ckpt=args.Progen2_model_name_or_path, fp16=args.fp16).to(device)
     config = json.load(open(args.Progen2_model_name_or_path+os.sep+'config.json',"r"))
     print("Maximum context length: {}".format(config['n_positions']))
     
@@ -137,10 +144,12 @@ def main():
     DMS_id=list_DMS[args.DMS_index]
     print("Computing scores for: {} with Progen2: {}".format(DMS_id, args.Progen2_model_name_or_path))
     DMS_file_name = mapping_protein_seq_DMS["DMS_filename"][mapping_protein_seq_DMS["DMS_id"]==DMS_id].values[0]
-    target_seq = mapping_protein_seq_DMS["target_seq"][mapping_protein_seq_DMS["DMS_id"]==DMS_id].values[0].upper()
+    
     
     DMS_data = pd.read_csv(args.DMS_data_folder + os.sep + DMS_file_name, low_memory=False)
     if not args.indel_mode and "mutated_sequence" not in DMS_data.columns:
+        # target_seq isn't used for indel_mode
+        target_seq = mapping_protein_seq_DMS["target_seq"][mapping_protein_seq_DMS["DMS_id"]==DMS_id].values[0].upper()
         DMS_data['mutated_sequence'] = DMS_data['mutant'].apply(lambda x: get_mutated_sequence(target_seq, x)) # if not args.indel_mode else DMS_data['mutant'].map(lambda x: "1"+x+"2")
 
     if args.test:
@@ -156,15 +165,19 @@ def main():
                 'progen2-large': (x_uniref90bfd30, -1.8),
                 'progen2-xlarge': (x_uniref90bfd30, -1.0),
         }
-        model_scores = calc_fitness(model=model, prots=np.array([checkpoint_x_ll[model_size][0]]), tokenizer=tokenizer, fp16=args.fp16, reduction='sum')
+        model_scores = calc_fitness(model=model, prots=np.array([checkpoint_x_ll[model_size][0]]), tokenizer=tokenizer, fp16=args.fp16, reduction='sum', device=device)
         print(model_scores, checkpoint_x_ll[model_size][1], abs(model_scores - checkpoint_x_ll[model_size][1]))
         assert abs(model_scores - checkpoint_x_ll[model_size][1]) < 0.1
+        print("Test: Outputs correct")
     
-    model_scores = calc_fitness(model=model, prots=np.array(DMS_data['mutated_sequence']), model_context_len=int(config['n_positions']), tokenizer=tokenizer, fp16=args.fp16)
+    model_scores = calc_fitness(model=model, prots=np.array(DMS_data['mutated_sequence']), model_context_len=int(config['n_positions']), tokenizer=tokenizer, fp16=args.fp16, device=device)
     
     DMS_data['Progen2_score']=model_scores
     scoring_filename = args.output_scores_folder+os.sep+DMS_id+'.csv'
-    DMS_data[['mutant','Progen2_score','DMS_score']].to_csv(scoring_filename, index=False)
+    if args.raw_score:
+        DMS_data[['mutated_sequence','Progen2_score']].to_csv(scoring_filename, index=False)
+    else:
+        DMS_data[['mutated_sequence','Progen2_score','DMS_score']].to_csv(scoring_filename, index=False)
 
 if __name__ == '__main__':
     main()
