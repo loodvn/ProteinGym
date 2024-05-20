@@ -139,7 +139,7 @@ def create_parser():
         "--scoring-strategy",
         type=str,
         default="masked-marginals",  # ESM1v, ESM2, MSATransformer all use masked-marginals: ESM1b with the Brandes paper use wt-marginals
-        choices=["wt-marginals", "pseudo-ppl", "masked-marginals"],
+        choices=["wt-marginals", "pseudo-ppl", "masked-marginals", "wt-pseudo-ppl"],
         help=""
     )
     parser.add_argument(
@@ -264,6 +264,8 @@ def compute_pppl_mutated_sequence(row, model, alphabet, device):
     if len(sequence) > 1022:
         print("Custom pppl: Not supporting sliding window. Returning 0")
         return 0
+        # To implement sliding window, we'd need to precompute the WT marginals for each window, and then recompute only the windows that we care about
+        # But much easier: Just compute the window in which the <mask> is in the middle
     # print("Debug length = ", len(sequence))
 
     # encode the sequence
@@ -286,7 +288,70 @@ def compute_pppl_mutated_sequence(row, model, alphabet, device):
             token_probs = torch.log_softmax(model(batch_tokens_masked.to(device))["logits"], dim=-1)
         log_probs.append(token_probs[0, i, alphabet.get_idx(sequence[i])].item())  # vocab size
     return sum(log_probs)
+
+def compute_wt_pppl(wt_sequence, model, alphabet, device):
+    token_probs = compute_wt_marginals(wt_sequence, model, alphabet, device, scoring_window="overlapping")
     
+    log_probs = []
+    # Starts at 1 and ends at len(sequence) - 1 because of the <BOS> and <EOS> tokens
+    for i in range(1, len(wt_sequence) - 1):
+        log_probs.append(token_probs[0, i, alphabet.get_idx(wt_sequence[i])].item())
+    return sum(log_probs)
+    
+    # return token_probs.sum().cpu().item()
+
+def compute_wt_marginals(wt_sequence, model, alphabet, device, scoring_window):
+    data = [("wt", wt_sequence)]
+
+    batch_converter = alphabet.get_batch_converter()
+    batch_labels, batch_strs, batch_tokens = batch_converter(data)
+    # Only seems to be implemented for overlapping scoring window
+    with torch.no_grad():
+        if batch_tokens.size(1) > 1024:
+            assert scoring_window=="overlapping", f"Can only score wt-marginals with overlapping scoring window. {scoring_window} given"
+            batch_size, seq_len = batch_tokens.shape #seq_len includes BOS and EOS
+            token_probs = torch.zeros((batch_size,seq_len,len(alphabet))).to(device) # Note: batch_size = 1 (need to keep batch dimension to score with model though)
+            token_weights = torch.zeros((batch_size,seq_len)).to(device)
+            weights = torch.ones(1024).to(device) # 1 for 256≤i<1022-256
+            for i in range(1,257):
+                weights[i] = 1 / (1 + math.exp(-(i-128)/16))
+            for i in range(1022-256,1023):
+                weights[i] = 1 / (1 + math.exp((i-1022+128)/16))
+            start_left_window = 0
+            end_left_window = 1023 #First window is indexed [0-1023]
+            start_right_window = (batch_tokens.size(1) - 1) - 1024 + 1 #Last index is len-1
+            end_right_window = batch_tokens.size(1) - 1
+            while True: 
+                # Left window update
+                left_window_probs = torch.log_softmax(model(batch_tokens[:,start_left_window:end_left_window+1].to(device))["logits"], dim=-1)
+                token_probs[:,start_left_window:end_left_window+1] += left_window_probs * weights.view(-1,1)
+                token_weights[:,start_left_window:end_left_window+1] += weights
+                # Right window update
+                right_window_probs = torch.log_softmax(model(batch_tokens[:,start_right_window:end_right_window+1].to(device))["logits"], dim=-1)
+                token_probs[:,start_right_window:end_right_window+1] += right_window_probs * weights.view(-1,1)
+                token_weights[:,start_right_window:end_right_window+1] += weights
+                if end_left_window > start_right_window:
+                    #overlap between windows in that last scoring so we break from the loop
+                    break
+                start_left_window+=511
+                end_left_window+=511
+                start_right_window-=511
+                end_right_window-=511
+            #If central overlap not wide engouh, we add one more window at the center
+            final_overlap = end_left_window - start_right_window + 1
+            if final_overlap < 511:
+                start_central_window = int(seq_len / 2) - 512
+                end_central_window = start_central_window + 1023
+                central_window_probs = torch.log_softmax(model(batch_tokens[:,start_central_window:end_central_window+1].to(device))["logits"], dim=-1)
+                token_probs[:,start_central_window:end_central_window+1] += central_window_probs * weights.view(-1,1)
+                token_weights[:,start_central_window:end_central_window+1] += weights
+            #Weight normalization
+            token_probs = token_probs / token_weights.view(-1,1) #Add 1 to broadcast
+        else:                    
+            token_probs = torch.log_softmax(model(batch_tokens.to(device))["logits"], dim=-1)
+        
+    return token_probs
+
 def compute_pppl_mutated_sequence_batched(row, model, alphabet, device, position_batch_size=2):
     sequence = row
     
@@ -345,7 +410,7 @@ def main(args):
         row = row.iloc[0]
         row = row.replace(np.nan, "")  # Makes it more manageable to use in strings
 
-        if args.scoring_strategy == "pseudo-ppl":
+        if "pseudo-ppl" in args.scoring_strategy:
             print("Note: pseudo-ppl not normalizing by WT")
             args.sequence = ""
         else:
@@ -376,6 +441,7 @@ def main(args):
                 target_seq_start_index = msa_start_index
                 target_seq_end_index = msa_end_index
         df = pd.read_csv(args.dms_input)
+        print("tmp df head: ", df.head())
         args.mutation_col='mutant'
     else:
         print(f"DMS index is None, using args.dms_input as a filename directly: {args.dms_input}")
@@ -455,48 +521,7 @@ def main(args):
             batch_labels, batch_strs, batch_tokens = batch_converter(data)
 
             if args.scoring_strategy == "wt-marginals":
-                with torch.no_grad():
-                    if batch_tokens.size(1) > 1024 and args.scoring_window=="overlapping": 
-                        batch_size, seq_len = batch_tokens.shape #seq_len includes BOS and EOS
-                        token_probs = torch.zeros((batch_size,seq_len,len(alphabet))).to(device) # Note: batch_size = 1 (need to keep batch dimension to score with model though)
-                        token_weights = torch.zeros((batch_size,seq_len)).to(device)
-                        weights = torch.ones(1024).to(device) # 1 for 256≤i<1022-256
-                        for i in range(1,257):
-                            weights[i] = 1 / (1 + math.exp(-(i-128)/16))
-                        for i in range(1022-256,1023):
-                            weights[i] = 1 / (1 + math.exp((i-1022+128)/16))
-                        start_left_window = 0
-                        end_left_window = 1023 #First window is indexed [0-1023]
-                        start_right_window = (batch_tokens.size(1) - 1) - 1024 + 1 #Last index is len-1
-                        end_right_window = batch_tokens.size(1) - 1
-                        while True: 
-                            # Left window update
-                            left_window_probs = torch.log_softmax(model(batch_tokens[:,start_left_window:end_left_window+1].to(device))["logits"], dim=-1)
-                            token_probs[:,start_left_window:end_left_window+1] += left_window_probs * weights.view(-1,1)
-                            token_weights[:,start_left_window:end_left_window+1] += weights
-                            # Right window update
-                            right_window_probs = torch.log_softmax(model(batch_tokens[:,start_right_window:end_right_window+1].to(device))["logits"], dim=-1)
-                            token_probs[:,start_right_window:end_right_window+1] += right_window_probs * weights.view(-1,1)
-                            token_weights[:,start_right_window:end_right_window+1] += weights
-                            if end_left_window > start_right_window:
-                                #overlap between windows in that last scoring so we break from the loop
-                                break
-                            start_left_window+=511
-                            end_left_window+=511
-                            start_right_window-=511
-                            end_right_window-=511
-                        #If central overlap not wide engouh, we add one more window at the center
-                        final_overlap = end_left_window - start_right_window + 1
-                        if final_overlap < 511:
-                            start_central_window = int(seq_len / 2) - 512
-                            end_central_window = start_central_window + 1023
-                            central_window_probs = torch.log_softmax(model(batch_tokens[:,start_central_window:end_central_window+1].to(device))["logits"], dim=-1)
-                            token_probs[:,start_central_window:end_central_window+1] += central_window_probs * weights.view(-1,1)
-                            token_weights[:,start_central_window:end_central_window+1] += weights
-                        #Weight normalization
-                        token_probs = token_probs / token_weights.view(-1,1) #Add 1 to broadcast
-                    else:                    
-                        token_probs = torch.log_softmax(model(batch_tokens.to(device))["logits"], dim=-1)
+                token_probs = compute_wt_marginals(args.sequence, model, alphabet, device, args.scoring_window)
                 df[model_location] = df.apply(
                     lambda row: label_row(
                         row[args.mutation_col],
@@ -544,6 +569,13 @@ def main(args):
                     lambda row: compute_pppl_mutated_sequence(  # compute_pppl(
                         row["mutated_sequence"], model, alphabet, device,
                     ),
+                    axis=1,
+                )
+            elif args.scoring_strategy == "wt-pseudo-ppl":
+                tqdm.pandas()
+                print("tmp, wt-pseudo-ppl only implemented for mutated_sequence == WT")
+                df[model_location] = df.progress_apply(
+                    lambda row: compute_wt_pppl(row["mutated_sequence"], model, alphabet, device),
                     axis=1,
                 )
     # Compute ensemble score Ensemble_ESM1v, standardizes each model score and then averages them
