@@ -1,6 +1,7 @@
 import argparse
 import pathlib
 import os,sys
+import copy
 import math
 import random
 import numpy as np
@@ -63,6 +64,7 @@ def read_msa(filename: str, nseq: int, sampling_strategy: str, random_seed: int,
         all_sequences_msa=[]
         weights=[]
         msa=[]
+        # Start off with just the focus sequence
         for seq_name in MSA.raw_seq_name_to_sequence.keys():
             if seq_name == MSA.focus_seq_name:
                 msa.append((seq_name,MSA.raw_seq_name_to_sequence[seq_name]))
@@ -71,6 +73,7 @@ def read_msa(filename: str, nseq: int, sampling_strategy: str, random_seed: int,
                 if seq_name in MSA.seq_name_to_weight:
                     all_sequences_msa.append((seq_name,MSA.raw_seq_name_to_sequence[seq_name]))
                     weights.append(MSA.seq_name_to_weight[seq_name])
+        # Add the other sequences in
         if len(all_sequences_msa)>0:
             weights = np.array(weights) / np.array(list(MSA.seq_name_to_weight.values())).sum()
             print("Check sum weights MSA: "+str(weights.sum()))
@@ -292,13 +295,16 @@ def compute_pppl_mutated_sequence(row, model, alphabet, device):
 def compute_wt_pppl(wt_sequence, model, alphabet, device):
     token_probs = compute_wt_marginals(wt_sequence, model, alphabet, device, scoring_window="overlapping")
     
+    return token_probs_to_wt_pppl(token_probs, wt_sequence, alphabet)  # The caller should probably call these separately actually..
+    
+    # return token_probs.sum().cpu().item()
+
+def token_probs_to_wt_pppl(token_probs, wt_sequence, alphabet, offset_idx):
     log_probs = []
     # Starts at 1 and ends at len(sequence) - 1 because of the <BOS> and <EOS> tokens
     for i in range(1, len(wt_sequence) - 1):
-        log_probs.append(token_probs[0, i, alphabet.get_idx(wt_sequence[i])].item())
+        log_probs.append(token_probs[0, i-offset_idx, alphabet.get_idx(wt_sequence[i])].item())
     return sum(log_probs)
-    
-    # return token_probs.sum().cpu().item()
 
 def compute_wt_marginals(wt_sequence, model, alphabet, device, scoring_window):
     data = [("wt", wt_sequence)]
@@ -351,39 +357,6 @@ def compute_wt_marginals(wt_sequence, model, alphabet, device, scoring_window):
             token_probs = torch.log_softmax(model(batch_tokens.to(device))["logits"], dim=-1)
         
     return token_probs
-
-def compute_pppl_mutated_sequence_batched(row, model, alphabet, device, position_batch_size=2):
-    sequence = row
-    
-    if len(sequence) > 1022:
-        print("Custom pppl: Not supporting sliding window. Returning 0")
-        return 0
-    print("Debug length = ", len(sequence))
-    
-    # encode the sequence again but manually replace with mask tokens
-    data = []
-    # Here we mask out the full length of the sequence - it's just that when we read the tokens back, we'll manually skip the first and last position (which should work out correctly)
-    for i in range(len(sequence)):
-        data.append((str(i), sequence[:i] + "<mask>" + sequence[i+1:]))  
-
-    batch_converter = alphabet.get_batch_converter()
-    
-    # compute probabilities at each position
-    sequence = row
-    log_probs = []
-    
-    # Note: This doesn't speed anything up on my Mac.. Still 2 tokens per second. But worth a try.
-    for i in tqdm(range(0, len(sequence), position_batch_size)):
-        data_subset = data[i:i+position_batch_size]
-        batch_labels, batch_strs, batch_tokens = batch_converter(data_subset)
-        print(f"Batch sizes custom token masking: {batch_tokens.size()}")
-        batch_lens = (batch_tokens != alphabet.padding_idx).sum(1)
-        print(f"Batch lengths custom token masking: {batch_lens}")
-        with torch.no_grad():
-            token_probs = torch.log_softmax(model(batch_tokens.to(device))["logits"], dim=-1)
-        for j in range(batch_tokens.shape[0]):
-            log_probs.append(token_probs[0, i+j, alphabet.get_idx(sequence[i+j])].item())
-    return sum(log_probs)
 
 
 def main(args):
@@ -476,35 +449,30 @@ def main(args):
                 data = [read_msa(filename=args.msa_path, nseq=args.msa_samples, sampling_strategy=args.msa_sampling_strategy, random_seed=seed, weight_filename=MSA_weight_file_name,
                                 filter_msa=args.filter_msa, hhfilter_min_cov=args.hhfilter_min_cov, hhfilter_max_seq_id=args.hhfilter_max_seq_id, hhfilter_min_seq_id=args.hhfilter_min_seq_id, path_to_hhfilter=args.path_to_hhfilter)]
                 assert (
-                    args.scoring_strategy == "masked-marginals"
-                ), "MSA Transformer only supports masked marginal strategy"
-
+                    args.scoring_strategy in ["masked-marginals", "wt-pseudoppl"]
+                ), "MSA Transformer only supports masked marginal or wt-pseudoppl strategy"
+                
+                
                 batch_labels, batch_strs, batch_tokens = batch_converter(data)
                 print(f"Batch sizes: {batch_tokens.size()}")
-
-                all_token_probs = []
-                for i in tqdm(range(batch_tokens.size(2))):
-                    batch_tokens_masked = batch_tokens.clone()
-                    batch_tokens_masked[0, 0, i] = alphabet.mask_idx  # mask out first sequence
-                    if batch_tokens.size(-1) > 1024: 
-                        large_batch_tokens_masked=batch_tokens_masked.clone()
-                        start, end = get_optimal_window(mutation_position_relative=i, seq_len_wo_special=len(args.sequence)+2, model_window=1024)
-                        print("Start index {} - end index {}".format(start,end))
-                        batch_tokens_masked = large_batch_tokens_masked[:,:,start:end]
-                    else:
-                        start=0
-                    with torch.no_grad():
-                        token_probs = torch.log_softmax(
-                            model(batch_tokens_masked.to(device))["logits"], dim=-1
-                        )
-                    all_token_probs.append(token_probs[:, 0, i-start].detach().cpu())  # vocab size
-                token_probs = torch.cat(all_token_probs, dim=0).unsqueeze(0) 
-                df[f"{model_location}_seed{seed}"] = df.apply(
-                    lambda row: label_row(
-                        row[args.mutation_col], args.sequence, token_probs.detach().cpu(), alphabet, args.offset_idx
-                    ),
-                    axis=1,
-                )
+                
+                if args.scoring_strategy == "masked-marginals":
+                    masked_marginal_token_probs = compute_masked_marginals_MSAT(batch_tokens=batch_tokens, sequence=args.sequence, device=device, model=model, alphabet=alphabet)
+                    df[f"{model_location}_seed{seed}"] = df.apply(
+                        lambda row: label_row(
+                            row[args.mutation_col], args.sequence, masked_marginal_token_probs.detach().cpu(), alphabet, args.offset_idx
+                        ),
+                        axis=1,
+                    )
+                elif args.scoring_strategy == "wt-pseudoppl":
+                    wt_token_probs = compute_wt_marginals_MSAT(batch_tokens=batch_tokens, sequence=args.sequence, device=device, model=model, alphabet=alphabet)
+                    
+                    # Need to use the same MSA, but can score multiple sequences fine  
+                    df[f"{model_location}_seed{seed}"] = df.apply(
+                        lambda row: token_probs_to_wt_pppl(token_probs=wt_token_probs, wt_sequence=row["mutated_sequence"], alphabet=alphabet, offset_idx=args.offset_idx),
+                        axis=1,
+                    )
+                
                 if os.path.exists(args.dms_output) and not args.overwrite_prior_scores:
                     prior_score_df = pd.read_csv(args.dms_output)
                     assert f"{model_location}_seed{seed}" not in prior_score_df.columns, f"Column {model_location}_seed{seed} already exists in {args.dms_output}"
@@ -593,8 +561,72 @@ def main(args):
         df[f"{model_location}_ensemble"] /= len(args.seeds)
     df.to_csv(args.dms_output,index=False)
 
+def compute_masked_marginals_MSAT(batch_tokens, sequence, device, model, alphabet):
+    all_token_probs = []
+    for i in tqdm(range(batch_tokens.size(2))):
+        batch_tokens_masked = batch_tokens.clone()
+        batch_tokens_masked[0, 0, i] = alphabet.mask_idx  # mask out first sequence
+        if batch_tokens.size(-1) > 1024: 
+            large_batch_tokens_masked=batch_tokens_masked.clone()
+            start, end = get_optimal_window(mutation_position_relative=i, seq_len_wo_special=len(sequence)+2, model_window=1024)
+            print("Start index {} - end index {}".format(start,end))
+            batch_tokens_masked = large_batch_tokens_masked[:,:,start:end]
+        else:
+            start=0
+        with torch.no_grad():
+            token_probs = torch.log_softmax(
+                            model(batch_tokens_masked.to(device))["logits"], dim=-1
+                        )
+        all_token_probs.append(token_probs[:, 0, i-start].detach().cpu())  # vocab size
+    token_probs = torch.cat(all_token_probs, dim=0).unsqueeze(0)
+
+def compute_wt_marginals_MSAT(batch_tokens, sequence, device, model, alphabet):
+    if batch_tokens.size(-1) > 1024: 
+        print("Overlapping not yet implemented for MSAT wt-marginals")
+        sys.exit(0)
+    with torch.no_grad():
+        token_probs = torch.log_softmax(model(batch_tokens.to(device))["logits"], dim=-1)
+        token_probs_first_sequence = token_probs[:, 0, :].detach().cpu()
+    return token_probs_first_sequence.unsqueeze(0)  # B, L, A (but batch_size is 1, it's just for ease of use)
 
 if __name__ == "__main__":
     parser = create_parser()
     args = parser.parse_args()
     main(args)
+    
+    
+    
+    
+### Buggy, fix later:
+# def compute_pppl_mutated_sequence_batched(row, model, alphabet, device, position_batch_size=2):
+#     sequence = row
+    
+#     if len(sequence) > 1022:
+#         print("Custom pppl: Not supporting sliding window. Returning 0")
+#         return 0
+#     print("Debug length = ", len(sequence))
+    
+#     # encode the sequence again but manually replace with mask tokens
+#     data = []
+#     # Here we mask out the full length of the sequence - it's just that when we read the tokens back, we'll manually skip the first and last position (which should work out correctly)
+#     for i in range(len(sequence)):
+#         data.append((str(i), sequence[:i] + "<mask>" + sequence[i+1:]))  
+
+#     batch_converter = alphabet.get_batch_converter()
+    
+#     # compute probabilities at each position
+#     sequence = row
+#     log_probs = []
+    
+#     # Note: This doesn't speed anything up on my Mac.. Still 2 tokens per second. But worth a try.
+#     for i in tqdm(range(0, len(sequence), position_batch_size)):
+#         data_subset = data[i:i+position_batch_size]
+#         batch_labels, batch_strs, batch_tokens = batch_converter(data_subset)
+#         print(f"Batch sizes custom token masking: {batch_tokens.size()}")
+#         batch_lens = (batch_tokens != alphabet.padding_idx).sum(1)
+#         print(f"Batch lengths custom token masking: {batch_lens}")
+#         with torch.no_grad():
+#             token_probs = torch.log_softmax(model(batch_tokens.to(device))["logits"], dim=-1)
+#         for j in range(batch_tokens.shape[0]):
+#             log_probs.append(token_probs[0, i+j, alphabet.get_idx(sequence[i+j])].item())
+#     return sum(log_probs)

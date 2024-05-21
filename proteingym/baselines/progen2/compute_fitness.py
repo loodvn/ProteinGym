@@ -33,7 +33,7 @@ def create_tokenizer_custom(file):
 
 def calc_fitness(model, prots, tokenizer, device='cuda:0', model_context_len=1024, fp16=False, reduction='mean'):
     loss_list = []
-    loss_fn = CrossEntropyLoss()
+    loss_fn = CrossEntropyLoss(reduction="sum")  # We'll manually normalize to length at the end
     with torch.no_grad():
         with torch.cuda.amp.autocast(enabled=fp16):
             for prot in tqdm.tqdm(prots):
@@ -51,8 +51,11 @@ def calc_fitness(model, prots, tokenizer, device='cuda:0', model_context_len=102
                         start += model_context_len
                 
                 for chunk in sequence_chunks:
-                    for p in [chunk, chunk[::-1]]:
-                        ids = torch.tensor(tokenizer.encode(p).ids).to(device)
+                    # mirroring
+                    l_to_r = chunk
+                    r_to_l = chunk[::-1]  # ProGen scores bidirectionally with the same model
+                    for seq_chunk in [l_to_r, r_to_l]:
+                        ids = torch.tensor(tokenizer.encode(seq_chunk).ids).to(device)
 
                         input_ids = ids[:-1]
                         targets   = ids[1:]
@@ -73,7 +76,6 @@ def calc_fitness(model, prots, tokenizer, device='cuda:0', model_context_len=102
                         targets = targets - first_token
 
                         assert logits.shape[1] == (last_token - first_token + 1)
-
                         loss = loss_fn(target=targets.view(-1), input=logits.view(-1,logits.size(-1)))
                         loss_val += - loss.item()
                 
