@@ -142,7 +142,7 @@ def create_parser():
         "--scoring-strategy",
         type=str,
         default="masked-marginals",  # ESM1v, ESM2, MSATransformer all use masked-marginals: ESM1b with the Brandes paper use wt-marginals
-        choices=["wt-marginals", "pseudo-ppl", "masked-marginals", "wt-pseudo-ppl"],
+        choices=["wt-marginals", "pseudo-ppl", "masked-marginals", "wt-pseudo-ppl", "masked-pseudo-ppl"],
         help=""
     )
     parser.add_argument(
@@ -232,7 +232,6 @@ def label_row(row, sequence, token_probs, alphabet, offset_idx):
         score += (token_probs[0, 1 + idx, mt_encoded] - token_probs[0, 1 + idx, wt_encoded]).item()
     return score
 
-
 def compute_pppl(row, sequence, model, alphabet, offset_idx, device):
     wt, idx, mt = row[0], int(row[1:-1]) - offset_idx, row[-1]
     assert sequence[idx] == wt, "The listed wildtype does not match the provided sequence"
@@ -303,12 +302,12 @@ def token_probs_to_wt_pppl(token_probs, wt_sequence, alphabet, offset_idx):
     log_probs = []
     # offset = offset_idx - 1  # Decrementing because we're not using 1-indexed mutations when doing pseudo-ppl
     
-    print("Ignoring offset_idx because we've already chopped the WT_sequence to the correct length")
+    # print("Ignoring offset_idx because we've already chopped the WT_sequence to the correct length")
     start_bos_offset = 1 if alphabet.prepend_bos else 0
     eos_offset = 1 if alphabet.append_eos else 0
     total_offsets = start_bos_offset + eos_offset
     assert len(wt_sequence) == (token_probs.shape[1]-total_offsets), f"{len(wt_sequence)} vs {(token_probs.shape[1]-total_offsets)}"
-    for i in tqdm(range(len(wt_sequence))):
+    for i in range(len(wt_sequence)):
         # The tensor is +1 because of the <BOS> token
         log_probs.append(token_probs[0, i+start_bos_offset, alphabet.get_idx(wt_sequence[i])].item())
     return sum(log_probs)
@@ -390,7 +389,7 @@ def main(args):
         row = row.iloc[0]
         row = row.replace(np.nan, "")  # Makes it more manageable to use in strings
 
-        if "pseudo-ppl" in args.scoring_strategy:
+        if args.scoring_strategy == "pseudo-ppl":
             print("Note: pseudo-ppl not normalizing by WT")
             args.sequence = ""
         else:
@@ -495,12 +494,20 @@ def main(args):
                     df = prior_score_df 
                 else:
                     df.to_csv(args.dms_output, index=False)
-        else:
+        else:  # ESM1v of ESM2
             args.offset_idx = target_seq_start_index
             data = [
                 ("protein1", args.sequence),
             ]
             batch_labels, batch_strs, batch_tokens = batch_converter(data)
+
+            # tmp writing out marginals
+            # print("tmp writing out marginals")
+            # token_probs_wt = compute_wt_marginals(args.sequence, model, alphabet, device, args.scoring_window)
+            # np.save("./token_probs_wt.npy", token_probs_wt.detach().cpu().numpy())
+            # token_probs_masked = compute_masked_marginals(args.sequence, args.scoring_window, device, model, alphabet, batch_tokens)
+            # np.save("./token_probs_masked.npy", token_probs_masked.detach().cpu().numpy())
+            # exit(0)
 
             if args.scoring_strategy == "wt-marginals":
                 token_probs = compute_wt_marginals(args.sequence, model, alphabet, device, args.scoring_window)
@@ -535,11 +542,13 @@ def main(args):
                         )
                     all_token_probs.append(token_probs[:, i-start])  # vocab size
                 token_probs = torch.cat(all_token_probs, dim=0).unsqueeze(0)
+                masked_marginal_token_probs = token_probs
+                #masked_marginal_token_probs = compute_masked_marginals(args.sequence, args.scoring_window, device, model, alphabet, batch_tokens)
                 df[model_location] = df.apply(
                     lambda row: label_row(
                         row[args.mutation_col],
                         args.sequence,
-                        token_probs,
+                        masked_marginal_token_probs,
                         alphabet,
                         args.offset_idx,
                     ),
@@ -555,11 +564,21 @@ def main(args):
                 )
             elif args.scoring_strategy == "wt-pseudo-ppl":
                 tqdm.pandas()
-                print("tmp, wt-pseudo-ppl only implemented for mutated_sequence == WT")
+                print("tmp target_seq = "+str(args.sequence))
+                token_probs = compute_wt_marginals(args.sequence, model, alphabet, device, scoring_window="overlapping")  # Get these once
                 df[model_location] = df.progress_apply(
-                    lambda row: compute_wt_pppl(row["mutated_sequence"], model, alphabet, device),
+                    lambda row: token_probs_to_wt_pppl(token_probs, row["mutated_sequence"], alphabet, offset_idx=None), # Offset index not used at the moment
                     axis=1,
                 )
+            elif args.scoring_strategy == "masked-pseudo-ppl":
+                tqdm.pandas()
+                masked_marginal_token_probs = compute_masked_marginals(args.sequence, args.scoring_window, device, model, alphabet, batch_tokens)
+                df[model_location] = df.progress_apply(
+                    lambda row: token_probs_to_wt_pppl(masked_marginal_token_probs, row["mutated_sequence"], alphabet, offset_idx=None), # Offset index not used at the moment
+                    axis=1,
+                )
+            else:
+                raise NotImplementedError
     # Compute ensemble score Ensemble_ESM1v, standardizes each model score and then averages them
     # note this assumes that all the input model checkpoints are ESM1v
     if "ESM1v" in args.model_type:
@@ -574,6 +593,28 @@ def main(args):
             df[f"{model_location}_ensemble"] += df[f"{model_location}_seed{seed}"]
         df[f"{model_location}_ensemble"] /= len(args.seeds)
     df.to_csv(args.dms_output,index=False)
+
+def compute_masked_marginals(sequence, scoring_window, device, model, alphabet, batch_tokens):
+    all_token_probs = []
+    for i in tqdm(range(batch_tokens.size(1))):
+        batch_tokens_masked = batch_tokens.clone()
+        batch_tokens_masked[0, i] = alphabet.mask_idx
+        if batch_tokens.size(1) > 1024 and scoring_window=="optimal": 
+            large_batch_tokens_masked=batch_tokens_masked.clone()
+            start, end = get_optimal_window(mutation_position_relative=i, seq_len_wo_special=len(sequence)+2, model_window=1024)
+            batch_tokens_masked = large_batch_tokens_masked[:,start:end]
+        elif batch_tokens.size(1) > 1024 and scoring_window=="overlapping": 
+            print("Overlapping not yet implemented for masked-marginals")
+            sys.exit(0)
+        else:
+            start=0
+        with torch.no_grad():
+            token_probs = torch.log_softmax(
+                            model(batch_tokens_masked.to(device))["logits"], dim=-1
+                        )
+        all_token_probs.append(token_probs[:, i-start])  # vocab size
+    token_probs = torch.cat(all_token_probs, dim=0).unsqueeze(0)
+    return token_probs
 
 def compute_masked_marginals_MSAT(batch_tokens, sequence, device, model, alphabet):
     all_token_probs = []
