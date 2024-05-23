@@ -126,6 +126,7 @@ def main():
     parser.add_argument('--test', action='store_true', help='Test mode of fitness computation')
     parser.add_argument("--device", default="cuda", type=str, help="Device (cuda or cpu or mps)")
     parser.add_argument("--raw_score", action="store_true", help="Whether to return raw scores, without any DMS_score or anything.")
+    # parser.add_argument("--mutant_col", default="mutant", type=str, help="Column name of mutant in DMS reference file")
     args = parser.parse_args()
     device = args.device
     
@@ -167,9 +168,9 @@ def main():
                 'progen2-large': (x_uniref90bfd30, -1.8),
                 'progen2-xlarge': (x_uniref90bfd30, -1.0),
         }
-        model_scores = calc_fitness(model=model, prots=np.array([checkpoint_x_ll[model_size][0]]), tokenizer=tokenizer, fp16=args.fp16, reduction='sum', device=device)
+        model_scores = calc_fitness(model=model, prots=np.array([checkpoint_x_ll[model_size][0]]), tokenizer=tokenizer, fp16=args.fp16, reduction='mean', device=device)
         print(model_scores, checkpoint_x_ll[model_size][1], abs(model_scores - checkpoint_x_ll[model_size][1]))
-        assert abs(model_scores - checkpoint_x_ll[model_size][1]) < 0.1
+        assert abs(model_scores - checkpoint_x_ll[model_size][1]) < 0.1, f"{checkpoint_x_ll[model_size][1]} expected, but got {model_scores}"
         print("Test: Outputs correct")
     
     model_scores = calc_fitness(model=model, prots=np.array(DMS_data['mutated_sequence']), model_context_len=int(config['n_positions']), tokenizer=tokenizer, fp16=args.fp16, device=device)

@@ -494,7 +494,7 @@ def main(args):
                     df = prior_score_df 
                 else:
                     df.to_csv(args.dms_output, index=False)
-        else:  # ESM1v of ESM2
+        else:  # ESM1v or ESM2
             args.offset_idx = target_seq_start_index
             data = [
                 ("protein1", args.sequence),
