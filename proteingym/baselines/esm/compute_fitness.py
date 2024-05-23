@@ -171,7 +171,7 @@ def create_parser():
     parser.add_argument(
         '--seeds',
         type=int,
-        default=1, 
+        default=[1], 
         help='Random seed used during training',
         nargs="+"
     )
@@ -301,9 +301,16 @@ def compute_wt_pppl(wt_sequence, model, alphabet, device):
 
 def token_probs_to_wt_pppl(token_probs, wt_sequence, alphabet, offset_idx):
     log_probs = []
-    # Starts at 1 and ends at len(sequence) - 1 because of the <BOS> and <EOS> tokens
-    for i in range(1, len(wt_sequence) - 1):
-        log_probs.append(token_probs[0, i-offset_idx, alphabet.get_idx(wt_sequence[i])].item())
+    # offset = offset_idx - 1  # Decrementing because we're not using 1-indexed mutations when doing pseudo-ppl
+    
+    print("Ignoring offset_idx because we've already chopped the WT_sequence to the correct length")
+    start_bos_offset = 1 if alphabet.prepend_bos else 0
+    eos_offset = 1 if alphabet.append_eos else 0
+    total_offsets = start_bos_offset + eos_offset
+    assert len(wt_sequence) == (token_probs.shape[1]-total_offsets), f"{len(wt_sequence)} vs {(token_probs.shape[1]-total_offsets)}"
+    for i in tqdm(range(len(wt_sequence))):
+        # The tensor is +1 because of the <BOS> token
+        log_probs.append(token_probs[0, i+start_bos_offset, alphabet.get_idx(wt_sequence[i])].item())
     return sum(log_probs)
 
 def compute_wt_marginals(wt_sequence, model, alphabet, device, scoring_window):
@@ -410,7 +417,8 @@ def main(args):
             
             MSA_weight_file_name = args.msa_weights_folder + os.sep + row["weight_file_name"] if ("weight_file_name" in mapping_protein_seq_DMS.columns and args.msa_weights_folder is not None) else None
             if ((target_seq_start_index!=msa_start_index) or (target_seq_end_index!=msa_end_index)):
-                args.sequence = args.sequence[msa_start_index-1:msa_end_index]
+                print(f"Chopping sequence by start {msa_start_index} and end {msa_end_index}")
+                args.sequence = args.sequence[msa_start_index-1:msa_end_index-1+1] # -1 because it's 1-indexed, but +1 because the end index is inclusive
                 target_seq_start_index = msa_start_index
                 target_seq_end_index = msa_end_index
         df = pd.read_csv(args.dms_input)
@@ -432,6 +440,8 @@ def main(args):
         model_location = model_location.split("/")[-1].split(".")[0]
         model.eval()
         model = model.to(device)
+        
+        print(f"Alphabet for {model_location}: {alphabet.prepend_bos=}, {alphabet.append_eos=}")
 
         batch_converter = alphabet.get_batch_converter()
 
@@ -449,10 +459,10 @@ def main(args):
                 data = [read_msa(filename=args.msa_path, nseq=args.msa_samples, sampling_strategy=args.msa_sampling_strategy, random_seed=seed, weight_filename=MSA_weight_file_name,
                                 filter_msa=args.filter_msa, hhfilter_min_cov=args.hhfilter_min_cov, hhfilter_max_seq_id=args.hhfilter_max_seq_id, hhfilter_min_seq_id=args.hhfilter_min_seq_id, path_to_hhfilter=args.path_to_hhfilter)]
                 assert (
-                    args.scoring_strategy in ["masked-marginals", "wt-pseudoppl"]
-                ), "MSA Transformer only supports masked marginal or wt-pseudoppl strategy"
+                    args.scoring_strategy in ["masked-marginals", "wt-pseudo-ppl"]
+                ), "MSA Transformer only supports masked marginal or wt-pseudo-ppl strategy"
                 
-                
+                print("length of first sequence in MSA: "+str(len(data[0][0][1])))
                 batch_labels, batch_strs, batch_tokens = batch_converter(data)
                 print(f"Batch sizes: {batch_tokens.size()}")
                 
@@ -464,12 +474,16 @@ def main(args):
                         ),
                         axis=1,
                     )
-                elif args.scoring_strategy == "wt-pseudoppl":
-                    wt_token_probs = compute_wt_marginals_MSAT(batch_tokens=batch_tokens, sequence=args.sequence, device=device, model=model, alphabet=alphabet)
-                    
+                elif args.scoring_strategy == "wt-pseudo-ppl":
+                    wt_sequence = data[0][0][1]
+                    wt_token_probs = compute_wt_marginals_MSAT(batch_tokens=batch_tokens, sequence=wt_sequence, device=device, model=model, alphabet=alphabet)
+                    if args.offset_idx != 1:
+                        print("Offset_idx = "+str(args.offset_idx))
                     # Need to use the same MSA, but can score multiple sequences fine  
+                    print("length between indices: "+str(target_seq_end_index-target_seq_start_index))
                     df[f"{model_location}_seed{seed}"] = df.apply(
-                        lambda row: token_probs_to_wt_pppl(token_probs=wt_token_probs, wt_sequence=row["mutated_sequence"], alphabet=alphabet, offset_idx=args.offset_idx),
+                        # Need to chop the mutated sequence accordingly too
+                        lambda row: token_probs_to_wt_pppl(token_probs=wt_token_probs, wt_sequence=row["mutated_sequence"][msa_start_index-1:msa_end_index], alphabet=alphabet, offset_idx=args.offset_idx),
                         axis=1,
                     )
                 
@@ -579,15 +593,22 @@ def compute_masked_marginals_MSAT(batch_tokens, sequence, device, model, alphabe
                         )
         all_token_probs.append(token_probs[:, 0, i-start].detach().cpu())  # vocab size
     token_probs = torch.cat(all_token_probs, dim=0).unsqueeze(0)
+    return token_probs
 
 def compute_wt_marginals_MSAT(batch_tokens, sequence, device, model, alphabet):
     if batch_tokens.size(-1) > 1024: 
         print("Overlapping not yet implemented for MSAT wt-marginals")
         sys.exit(0)
     with torch.no_grad():
-        token_probs = torch.log_softmax(model(batch_tokens.to(device))["logits"], dim=-1)
+        token_logits_out = model(batch_tokens.to(device))["logits"]
+        print("tmp MSAT logits shape: ", token_logits_out.shape)
+        token_probs = torch.log_softmax(token_logits_out, dim=-1)
         token_probs_first_sequence = token_probs[:, 0, :].detach().cpu()
-    return token_probs_first_sequence.unsqueeze(0)  # B, L, A (but batch_size is 1, it's just for ease of use)
+    
+    print("token probs before unsqueeze: ", token_probs_first_sequence.shape)
+    token_probs_first_sequence = token_probs_first_sequence#.unsqueeze(0)  # B, L, A (but batch_size is 1, it's just for ease of use)
+    print("tmp token probs shape: ", token_probs_first_sequence.shape)
+    return token_probs_first_sequence
 
 if __name__ == "__main__":
     parser = create_parser()
